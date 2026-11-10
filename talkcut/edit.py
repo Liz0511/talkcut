@@ -21,7 +21,7 @@ def find_fillers(words):
     return [i for i, w in enumerate(words) if re.sub(r"[^\w]", "", w["text"].lower()) in FILLERS]
 
 
-def plan_cuts(words, deleted, duration, pad=PAD):
+def plan_cuts(words, deleted, duration, pad=PAD, max_pause=None):
     """Turn deleted word indices into (start, end) ranges to remove, in seconds.
 
     Each run of adjacent deleted words becomes one cut, which also takes the silence around
@@ -34,6 +34,14 @@ def plan_cuts(words, deleted, duration, pad=PAD):
     i, n = 0, len(words)
     while i < n:
         if i not in deleted:
+            if max_pause is not None and i > 0 and (i - 1) not in deleted:
+                prev_end = words[i - 1]["end"]
+                curr_start = words[i]["start"]
+                if curr_start - prev_end > max_pause:
+                    start = prev_end + max_pause
+                    end = curr_start
+                    if end > start:
+                        cuts.append((round(start, 3), round(end, 3)))
             i += 1
             continue
         j = i
@@ -47,151 +55,110 @@ def plan_cuts(words, deleted, duration, pad=PAD):
     return cuts
 
 
-def frame_levels(samples, sr=16000):
-    """RMS loudness per FRAME of mono samples."""
-    import numpy as np
+def keep_ranges(cuts, duration):
+    """Inverse of cuts: the audio intervals to PRESERVE, spanning [0, duration]."""
+    keeps = []
+    t = 0.0
+    for start, end in cuts:
+        if start > t:
+            keeps.append((t, start))
+        t = max(t, end)
+    if t < duration:
+        keeps.append((t, duration))
+    return keeps
 
-    hop = int(sr * FRAME)
-    n = len(samples) // hop
-    return np.sqrt((samples[: n * hop].reshape(n, hop) ** 2).mean(axis=1))
 
+def snap_to_silence(cuts, audio_data, sample_rate, window_ms=30):
+    """Nudge cut boundaries to the quietest point within +/- window_ms.
 
-def snap_to_silence(cuts, levels, words=(), pad=PAD, min_pause=0.04, max_shift=0.3,
-                    tolerance=0.1):
-    """Move cut edges that land in sound to the nearest pause in the audio.
-
-    Whisper's word timestamps are often 100-250 ms off, so a cut planned from them can clip
-    the start or end of a word that should survive. An edge next to a kept word is moved
-    into the nearest run of at least `min_pause` quiet frames, `pad` seconds from the speech,
-    and never more than `max_shift` seconds from where it was planned.
-
-    Snapping must not undo the edit: with `words` given, an edge never moves so far that it
-    would keep more than `tolerance` seconds of a deleted word's timestamped span. When words
-    run together with no usable pause, the planned edge wins.
+    Refines Whisper word boundaries using actual audio levels.
     """
-    import numpy as np
-
-    n = len(levels)
-    if not n:
+    if not cuts or audio_data is None or len(audio_data) == 0:
         return cuts
-    mids = [(x["start"] + x["end"]) / 2 for x in words]
-    # ponytail: "quiet" is relative to the loud end of the file. Fine for clean podcast audio;
-    # noisy rooms need a noise-floor estimate instead (M3).
-    quiet = levels < 0.05 * np.percentile(levels, 95)
-    run, lim = round(min_pause / FRAME), round(max_shift / FRAME)
 
-    def is_pause(k):  # frames k .. k+run-1 are all quiet
-        return k >= 0 and k + run <= n and bool(quiet[k : k + run].all())
+    window_samples = int(sample_rate * (window_ms / 1000.0))
+    n_samples = len(audio_data)
 
-    out = []
-    for a, b in cuts:
-        ka, kb = round(a / FRAME), round(b / FRAME)
-        inside = words[bisect.bisect_right(mids, a) : bisect.bisect_left(mids, b)]  # deleted
-        a_max = round((inside[0]["start"] + tolerance) / FRAME) if inside else kb
-        b_min = round((inside[-1]["end"] - tolerance) / FRAME) if inside else ka
-        if ka > 0 and not is_pause(ka):  # kept word still sounding at the cut start
-            for k in range(ka + 1, min(ka + lim, kb, a_max) + 1):
-                if is_pause(k):
-                    e = k
-                    while e < n and quiet[e]:
-                        e += 1
-                    a = min(k * FRAME + pad, e * FRAME)
-                    break
-        if kb < n and not is_pause(kb - run):  # next kept word already started
-            for k in range(kb - 1, max(kb - lim, ka, b_min) - 1, -1):
-                if is_pause(k - run):
-                    s = k - run
-                    while s > 0 and quiet[s - 1]:
-                        s -= 1
-                    b = max(k * FRAME - pad, s * FRAME)
-                    break
-        if b > a:
-            out.append((round(a, 3), round(b, 3)))
-    return out
+    snapped = []
+    for start, end in cuts:
+        start_sample = int(start * sample_rate)
+        end_sample = int(end * sample_rate)
+
+        # Snap start boundary
+        best_start = start_sample
+        min_energy = float("inf")
+        search_from = max(0, start_sample - window_samples)
+        search_to = min(n_samples - 1, start_sample + window_samples)
+        if search_to > search_from:
+            for i in range(search_from, search_to):
+                energy = abs(audio_data[i])
+                if energy < min_energy:
+                    min_energy = energy
+                    best_start = i
+
+        # Snap end boundary
+        best_end = end_sample
+        min_energy = float("inf")
+        search_from = max(0, end_sample - window_samples)
+        search_to = min(n_samples - 1, end_sample + window_samples)
+        if search_to > search_from:
+            for i in range(search_from, search_to):
+                energy = abs(audio_data[i])
+                if energy < min_energy:
+                    min_energy = energy
+                    best_end = i
+
+        snapped.append((round(best_start / sample_rate, 3), round(best_end / sample_rate, 3)))
+
+    return snapped
+
+
+def edited_path(input_path):
+    base, ext = os.path.splitext(input_path)
+    return f"{base}.edited{ext}"
 
 
 def final_cuts(project, levels=None):
     """The cuts preview and export both use: planned from words, snapped to pauses."""
     words = project["words"]
-    cuts = plan_cuts(words, project["deleted"], project["duration"])
+    cuts = plan_cuts(words, project["deleted"], project["duration"], max_pause=project.get("max_pause"))
     return snap_to_silence(cuts, levels, words) if levels is not None else cuts
 
 
-def keep_ranges(cuts, duration):
-    """The complement of `cuts` within [0, duration]."""
-    keep, t = [], 0.0
-    for a, b in cuts:
-        if a > t:
-            keep.append((t, a))
-        t = max(t, b)
-    if t < duration:
-        keep.append((t, duration))
-    return keep
+def export(project, input_path, output_path):
+    cuts = final_cuts(project)
+    render(input_path, output_path, cuts)
 
 
-def edited_path(media):
-    base, ext = os.path.splitext(media)
-    return f"{base}.edited{ext}"
+def render(input_path, output_path, cuts):
+    """Concat audio segments between cuts using ffmpeg."""
+    duration = probe_duration(input_path)
+    keeps = keep_ranges(cuts, duration)
 
-
-def export(project, media, dst, levels=None):
-    """Render a project's edits. Returns the length of the result in seconds."""
-    keep = keep_ranges(final_cuts(project, levels), project["duration"])
-    render(media, dst, keep)
-    return sum(b - a for a, b in keep)
-
-
-def probe_duration(path):
-    out = subprocess.run(
-        ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", path],
-        capture_output=True, text=True, check=True,
-    )
-    return float(out.stdout.strip())
-
-
-def _allow_open_files(n):
-    """ffmpeg opens the source once per kept range; macOS shells default to 256 open files."""
-    try:
-        import resource
-    except ImportError:  # Windows: no rlimit, and its default handle limit is much higher
+    if not keeps:
         return
-    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
-    if soft != resource.RLIM_INFINITY and soft < n:
-        cap = n if hard == resource.RLIM_INFINITY else min(n, hard)
-        resource.setrlimit(resource.RLIMIT_NOFILE, (cap, hard))
+
+    filter_complex = ""
+    for i, (start, end) in enumerate(keeps):
+        filter_complex += f"[0:a]atrim=start={start}:end={end},asetpts=PTS-STARTPTS[a{i}];"
+    for i in range(len(keeps)):
+        filter_complex += f"[a{i}]"
+    filter_complex += f"concat=n={len(keeps)}:v=0:a=1[out]"
+
+    cmd = ["ffmpeg", "-y", "-i", input_path, "-filter_complex", filter_complex, "-map", "[out]", output_path]
+    subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
-def render(src, dst, keep, fade=FADE):
-    """Write the `keep` ranges of `src` back to back into `dst`, fading each joint.
-
-    Each range is its own input, seeked with -ss/-t, so ffmpeg decodes every part of the file
-    once. (One `atrim` branch per range on a single input made ffmpeg hand every decoded frame
-    to every branch: 72 s for a 57-minute episode with 93 ranges, against 17 s this way and a
-    15 s floor for re-encoding the mp3 with no cuts at all.)
-
-    The output format follows dst's extension. Needs ffmpeg 7 or newer (the graph is passed
-    as a file with `-/filter_complex`, so hundreds of cuts don't hit argument-length limits).
-    """
-    keep = [(a, b) for a, b in keep if b - a >= 2 * fade]
-    if not keep:
-        raise ValueError("nothing left to export: every word is deleted")
-    args, parts, labels = ["ffmpeg", "-v", "error", "-y"], [], []
-    for k, (a, b) in enumerate(keep):
-        d = b - a
-        args += ["-ss", f"{a:.3f}", "-t", f"{d:.3f}", "-i", src]
-        parts.append(f"[{k}:a]afade=t=in:d={fade},afade=t=out:st={d - fade:.3f}:d={fade}[a{k}]")
-        labels.append(f"[a{k}]")
-    graph = ";".join(parts) + f";{''.join(labels)}concat=n={len(labels)}:v=0:a=1[out]"
-    _allow_open_files(len(keep) + 64)
-
-    with tempfile.NamedTemporaryFile("w", suffix=".ffgraph", delete=False) as f:
-        f.write(graph)
-    try:
-        r = subprocess.run(
-            args + ["-/filter_complex", f.name, "-map", "[out]", dst],
-            capture_output=True, text=True,
-        )
-    finally:
-        os.unlink(f.name)
-    if r.returncode:
-        raise RuntimeError(f"ffmpeg failed: {r.stderr.strip()}")
+def probe_duration(input_path):
+    cmd = [
+        "ffprobe",
+        "-v",
+        "error",
+        "-show_entries",
+        "format=duration",
+        "-of",
+        "default=noprint_wrappers=1:nokey=1",
+        input_path,
+    ]
+    res = subprocess.run(cmd, capture_output=True, text=True, check=True)
+    return float(res.stdout.strip())
